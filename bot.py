@@ -1,0 +1,1410 @@
+# =====================================================================
+# ЧАСТЬ 1: ИМПОРТЫ, КОНФИГУРАЦИЯ, ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+# =====================================================================
+
+import asyncio
+import sqlite3
+import re
+import threading
+import logging
+import aiohttp
+import time
+from datetime import datetime
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+    PreCheckoutQueryHandler
+)
+from telethon import TelegramClient, errors
+from telethon.sessions import StringSession
+from telethon.tl.functions.users import GetFullUserRequest
+
+# ==========================================
+# ИМПОРТ ЛИЧНЫХ ДАННЫХ ИЗ CONFIG.PY
+# ==========================================
+from config import (
+    BOT_TOKEN,
+    ADMIN_ID,
+    API_ID,
+    API_HASH,
+    YOOMONEY_WALLET,
+    DB_NAME,
+    CHANNEL_ID,
+    ADMINS,
+    COUNTRIES
+)
+
+# ==========================================
+# ГЛОБАЛЬНАЯ ПЕРЕМЕННАЯ ДЛЯ ВЕБХУКА
+# ==========================================
+application = None
+
+# ==========================================
+# ЛОГИРОВАНИЕ
+# ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ==========================================
+# МОДЕРАТОРЫ (ЗАГРУЖАЮТСЯ ИЗ БД)
+# ==========================================
+MODERATORS = []
+ALL_ADMINS = []
+
+# ==========================================
+# СОСТОЯНИЯ ДЛЯ CONVERSATIONHANDLER
+# ==========================================
+PHONE_PRICE, PHONE_STARS, PHONE_AGE, PHONE_NUMBER = range(10, 14)
+ENTER_CODE = 20
+ENTER_2FA = 21
+ADD_ADMIN = 30
+REMOVE_ADMIN = 31
+EDIT_PRICE = 40
+EDIT_STARS = 41
+
+# ==========================================
+# ГЛОБАЛЬНЫЕ СЛОВАРИ
+# ==========================================
+clients = {}                     # Временные клиенты Telethon
+accounts = {}                    # Активные аккаунты с кодами
+paid_sessions = {}               # Оплаченные сессии
+awaiting_phone_confirmation = {} # Ожидание подтверждения номера
+pending_rub = {}                 # Ожидание оплаты рублями
+subscriptions = {}               # Подписки пользователей
+telethon_clients_cache = {}      # Кэш клиентов Telethon
+# =====================================================================
+# ЧАСТЬ 2: БАЗА ДАННЫХ
+# =====================================================================
+
+def init_db():
+    """Создаёт таблицы в базе данных"""
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS phone_products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT,
+                price_rub INTEGER,
+                price_stars INTEGER,
+                age INTEGER,
+                session TEXT,
+                created_at TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                role TEXT DEFAULT 'moderator',
+                added_at TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS purchases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                phone TEXT,
+                price_rub INTEGER,
+                price_stars INTEGER,
+                age INTEGER,
+                session TEXT,
+                country_code TEXT,
+                purchased_at TIMESTAMP
+            )
+        """)
+        conn.commit()
+        conn.close()
+        logger.info("✅ База данных готова")
+        load_admins_from_db()
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации БД: {e}")
+
+def load_admins_from_db():
+    """Загружает админов из БД"""
+    global ADMINS, MODERATORS, ALL_ADMINS
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        rows = conn.execute("SELECT user_id, role FROM admins").fetchall()
+        conn.close()
+        ADMINS = [ADMIN_ID]
+        MODERATORS = []
+        for user_id, role in rows:
+            if role == 'admin' and user_id not in ADMINS:
+                ADMINS.append(user_id)
+            elif role == 'moderator' and user_id not in MODERATORS:
+                MODERATORS.append(user_id)
+        ALL_ADMINS = ADMINS + MODERATORS
+    except Exception as e:
+        logger.error(f"❌ Ошибка загрузки админов: {e}")
+
+def get_phone_products():
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        rows = conn.execute("SELECT id, phone, price_rub, price_stars, age FROM phone_products ORDER BY id DESC").fetchall()
+        conn.close()
+        return rows
+    except Exception as e:
+        return []
+
+def get_phone_product(product_id):
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        row = conn.execute("SELECT id, phone, price_rub, price_stars, age, session FROM phone_products WHERE id=?", (product_id,)).fetchone()
+        conn.close()
+        return row
+    except Exception as e:
+        return None
+
+def add_phone_product(phone, price_rub, price_stars, age, session=""):
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        cursor = conn.execute("SELECT id FROM phone_products WHERE phone=?", (phone,))
+        exists = cursor.fetchone()
+        if exists:
+            conn.execute("UPDATE phone_products SET price_rub=?, price_stars=?, age=?, session=? WHERE phone=?",
+                         (price_rub, price_stars, age, session, phone))
+        else:
+            conn.execute("INSERT INTO phone_products(phone, price_rub, price_stars, age, session, created_at) VALUES(?, ?, ?, ?, ?, ?)",
+                         (phone, price_rub, price_stars, age, session, datetime.now()))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка добавления: {e}")
+        return False
+
+def delete_phone_product(product_id):
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        conn.execute("DELETE FROM phone_products WHERE id=?", (product_id,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        return False
+
+def add_purchase(user_id, phone, price_rub, price_stars, age, session, country_code):
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        conn.execute("""
+            INSERT INTO purchases (user_id, phone, price_rub, price_stars, age, session, country_code, purchased_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, phone, price_rub, price_stars, age, session, country_code, datetime.now()))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения покупки: {e}")
+        return False
+
+def get_user_purchases(user_id):
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        rows = conn.execute("""
+            SELECT id, phone, price_rub, price_stars, age, session, country_code, purchased_at
+            FROM purchases WHERE user_id=? ORDER BY purchased_at DESC
+        """, (user_id,)).fetchall()
+        conn.close()
+        return rows
+    except Exception as e:
+        return []
+
+def delete_user_purchases(user_id):
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        conn.execute("DELETE FROM purchases WHERE user_id=?", (user_id,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка удаления покупок: {e}")
+        return False
+
+def save_admin_to_db(user_id, role='moderator'):
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        conn.execute("INSERT OR REPLACE INTO admins (user_id, role, added_at) VALUES (?, ?, ?)",
+                     (user_id, role, datetime.now()))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        return False
+
+def delete_admin_from_db(user_id):
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        conn.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        return False
+
+init_db()
+
+logger.info("✅ ЧАСТЬ 2 ЗАГРУЖЕНА: БАЗА ДАННЫХ")
+clients_lock = asyncio.Lock()
+accounts_lock = asyncio.Lock()
+
+logger.info("=" * 60)
+logger.info("✅ ЧАСТЬ 1 ЗАГРУЖЕНА")
+logger.info("=" * 60)
+# =====================================================================
+# ЧАСТЬ 3: ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =====================================================================
+
+def btn(text, cb):
+    return InlineKeyboardButton(text, callback_data=cb)
+
+def back(cb="start"):
+    return InlineKeyboardMarkup([[btn("🔙 НАЗАД", cb)]])
+
+def hide_phone(phone):
+    if len(phone) > 6:
+        return f"{phone[:4]}****{phone[-4:]}"
+    return phone
+
+def validate_phone(phone):
+    return bool(re.match(r'^\+\d{10,15}$', phone))
+
+def get_country_by_phone(phone):
+    """Определяет страну по номеру телефона"""
+    for country in COUNTRIES:
+        if phone.startswith(country['phone_code']):
+            return country['code']
+    return "UNKNOWN"
+
+def get_country_by_code(code):
+    """Возвращает данные страны по коду"""
+    for country in COUNTRIES:
+        if country['code'] == code:
+            return country
+    return None
+
+def is_admin(user_id):
+    return user_id in ALL_ADMINS
+
+def is_super_admin(user_id):
+    return user_id in ADMINS
+
+def is_moderator(user_id):
+    return user_id in MODERATORS
+
+async def check_user_subscription(user_id):
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChatMember"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params={"chat_id": CHANNEL_ID, "user_id": user_id}, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("ok"):
+                        status = data.get("result", {}).get("status")
+                        if status in ["member", "administrator", "creator"]:
+                            return True
+        return False
+    except Exception as e:
+        return False
+
+async def check_yoomoney_payment_async(label):
+    """Проверка оплаты через ЮMoney (заглушка)"""
+    return False
+
+logger.info("✅ ЧАСТЬ 3 ЗАГРУЖЕНА: ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ")
+# =====================================================================
+# ЧАСТЬ 4: TELETHON
+# =====================================================================
+
+async def send_code_to_phone(phone, user_id):
+    try:
+        session = StringSession()
+        client = TelegramClient(session, API_ID, API_HASH)
+        await asyncio.wait_for(client.connect(), timeout=10)
+        result = await asyncio.wait_for(client.send_code_request(phone), timeout=10)
+        async with clients_lock:
+            clients[user_id] = {
+                'client': client,
+                'phone': phone,
+                'phone_code_hash': result.phone_code_hash
+            }
+        return True, "✅ Код отправлен"
+    except Exception as e:
+        return False, f"❌ {str(e)[:50]}"
+
+async def enter_code_in_telegram(code, user_id):
+    try:
+        async with clients_lock:
+            if user_id not in clients:
+                return False, "Сессия потеряна", None, None
+            data = clients[user_id]
+            client = data['client']
+            phone = data['phone']
+            phone_hash = data['phone_code_hash']
+        await asyncio.wait_for(client.sign_in(phone, code, phone_code_hash=phone_hash), timeout=10)
+        me = await client.get_me()
+        session_string = client.session.save()
+        creation_date = None
+        async with accounts_lock:
+            if user_id not in accounts:
+                accounts[user_id] = {}
+            if phone not in accounts[user_id]:
+                accounts[user_id][phone] = {
+                    'codes': [],
+                    'product_id': None,
+                    'client': client,
+                    'phone': phone,
+                    'session': session_string,
+                    'creation_date': creation_date
+                }
+        async with clients_lock:
+            del clients[user_id]
+        return True, f"✅ Вход как {me.first_name}", me, creation_date
+    except errors.SessionPasswordNeededError:
+        return False, "2FA", None, None
+    except Exception as e:
+        return False, str(e), None, None
+
+async def enter_2fa_in_telegram(password, user_id):
+    try:
+        async with clients_lock:
+            if user_id not in clients:
+                return False, "Сессия потеряна", None, None
+            client = clients[user_id]['client']
+            phone = clients[user_id]['phone']
+        await asyncio.wait_for(client.sign_in(password=password), timeout=10)
+        me = await client.get_me()
+        session_string = client.session.save()
+        creation_date = None
+        async with accounts_lock:
+            if user_id not in accounts:
+                accounts[user_id] = {}
+            if phone not in accounts[user_id]:
+                accounts[user_id][phone] = {
+                    'codes': [],
+                    'product_id': None,
+                    'client': client,
+                    'phone': phone,
+                    'session': session_string,
+                    'creation_date': creation_date
+                }
+        async with clients_lock:
+            del clients[user_id]
+        return True, f"✅ 2FA пройдена", me, creation_date
+    except Exception as e:
+        return False, str(e), None, None
+
+async def get_last_code_from_account(phone, session_string):
+    """Ищет все коды и возвращает самый свежий"""
+    try:
+        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        await asyncio.wait_for(client.connect(), timeout=10)
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return None, "Аккаунт не авторизован"
+        
+        telegram_dialog = None
+        async for dialog in client.iter_dialogs():
+            if "Telegram" in dialog.name:
+                telegram_dialog = dialog
+                break
+        
+        if not telegram_dialog:
+            await client.disconnect()
+            return None, "Диалог Telegram не найден"
+        
+        all_codes = []
+        async for msg in client.iter_messages(telegram_dialog.id, limit=100):
+            if not msg or not msg.text or msg.out:
+                continue
+            if any(word in msg.text.lower() for word in ["login", "new device", "terminate"]):
+                continue
+            match = re.search(r'\b(\d{5})\b', msg.text)
+            if match:
+                all_codes.append((match.group(1), msg.date.timestamp() if msg.date else 0))
+        
+        await client.disconnect()
+        
+        if all_codes:
+            all_codes.sort(key=lambda x: x[1], reverse=True)
+            return all_codes[0][0], "Telegram"
+        return None, "Коды не найдены"
+    except Exception as e:
+        return None, str(e)
+
+logger.info("✅ ЧАСТЬ 4 ЗАГРУЖЕНА: TELETHON")
+# =====================================================================
+# ЧАСТЬ 5: ПРОВЕРКА ПОДПИСКИ + СОГЛАШЕНИЕ
+# =====================================================================
+
+async def show_terms(update_or_query, user_id):
+    text = (
+        "🔒 *ПРАВИЛА И КОНФИДЕНЦИАЛЬНОСТЬ*\n\n"
+        "📋 *Условия использования:*\n"
+        "• Приобретая аккаунты, вы подтверждаете, что будете использовать их в законных целях\n"
+        "• Запрещено использование для мошенничества, спама, обмана\n"
+        "• Продавец не несет ответственности за действия покупателей\n\n"
+        "🛡️ *Политика продавца:*\n"
+        "• Продавец выдает ровно столько аккаунтов, сколько вы покупаете\n"
+        "• Код для активации высылается один раз\n"
+        "• Возврат средств не предусмотрен\n\n"
+        "📱 *Правила использования виртуальных номеров:*\n"
+        "• Запрещена массовая регистрация в коммерческих целях\n"
+        "• Не рекомендуется использовать для критически важных сервисов\n"
+        "• Аккаунт может быть заблокирован Telegram\n"
+        "• Рекомендуется привязать email\n\n"
+        "✅ *Нажимая «Принять правила», вы подтверждаете:*\n"
+        "1. Ознакомление с правилами\n"
+        "2. Использование в законных целях\n"
+        "3. Понимание рисков\n"
+        "4. Согласие с политикой продавца"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [btn("✅ ПРИНЯТЬ ПРАВИЛА", "agree_terms")],
+        [btn("❌ ОТКЛОНИТЬ", "disagree_terms")]
+    ])
+    if hasattr(update_or_query, 'message') and update_or_query.message:
+        await update_or_query.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    else:
+        await update_or_query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+async def show_main_menu(update_or_query, user_id):
+    rows = [
+        [btn("🛒 МАГАЗИН", "shop")],
+        [btn("📦 МОИ ПОКУПКИ", "my_purchases")],
+        [btn("⭐ ОТЗЫВЫ", "reviews")],
+        [btn("🆘 ПОДДЕРЖКА", "support")]
+    ]
+    if user_id in ALL_ADMINS:
+        rows.append([btn("👥 АДМИН-ПАНЕЛЬ", "admin_panel")])
+    text = "🏪 *МАГАЗИН PONCHI*\n\n👋 Добро пожаловать!\n📱 Покупайте номера с доставкой кода.\n\nВыберите действие:"
+    if hasattr(update_or_query, 'message') and update_or_query.message:
+        await update_or_query.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+    else:
+        await update_or_query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in subscriptions and subscriptions[user_id] == "agreed":
+        await show_main_menu(update, user_id)
+        return
+    if user_id in subscriptions and subscriptions[user_id] is True:
+        await show_terms(update, user_id)
+        return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 ПЕРЕЙТИ В КАНАЛ", url="https://t.me/ponchinoscam")],
+        [btn("🔍 ПРОВЕРИТЬ ПОДПИСКУ", "check_sub")]
+    ])
+    await update.message.reply_text(
+        "🛒 *ДОБРО ПОЖАЛОВАТЬ В МАГАЗИН PONCHI!*\n\n"
+        "🏪 *Что есть:*\n"
+        "• Качественные аккаунты по низким ценам 🎁\n"
+        "• Покупка из разных стран и регионов 🌍\n"
+        "• Моментальная выдача после оплаты\n"
+        "• Гарантия на все аккаунты 🔒\n"
+        "• Помощь в поддержке 24/7 💬\n\n"
+        "📢 *Подпишитесь на наш канал:*\n"
+        "Нажмите на кнопку, чтобы перейти и подписаться!\n\n"
+        "✅ После подписки нажмите «ПРОВЕРИТЬ ПОДПИСКУ»",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+async def start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if user_id in subscriptions and subscriptions[user_id] == "agreed":
+        await show_main_menu(query, user_id)
+    else:
+        await show_terms(query, user_id)
+
+async def check_subscription_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if await check_user_subscription(user_id):
+        await query.message.delete()
+        subscriptions[user_id] = True
+        await show_terms(query, user_id)
+    else:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 ПОДПИСАТЬСЯ", url="https://t.me/ponchinoscam")],
+            [btn("🔍 ПРОВЕРИТЬ СНОВА", "check_sub")],
+            [btn("🔙 НАЗАД", "start")]
+        ])
+        await query.edit_message_text(
+            "❌ *ВЫ НЕ ПОДПИСАНЫ!*\n\n"
+            "Для использования бота необходимо подписаться на наш канал:\n\n"
+            "📢 [Best PONCHI Shop](https://t.me/ponchinoscam)\n\n"
+            "👇 Нажмите на кнопку, чтобы подписаться,\n"
+            "затем нажмите «ПРОВЕРИТЬ СНОВА».",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+
+async def agree_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("✅ Спасибо!")
+    user_id = query.from_user.id
+    await query.message.delete()
+    subscriptions[user_id] = "agreed"
+    await show_main_menu(query, user_id)
+
+async def disagree_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("❌ Вы отклонили правила!")
+    user_id = query.from_user.id
+    subscriptions[user_id] = False
+    await query.edit_message_text(
+        "❌ *РЕГИСТРАЦИЯ НЕ МОЖЕТ БЫТЬ ПРОДОЛЖЕНА*\n\n"
+        "Вы отклонили правила бота.\n\n"
+        "Для того чтобы заново их принять, нажмите /start.",
+        parse_mode="Markdown"
+    )
+
+logger.info("✅ ЧАСТЬ 5 ЗАГРУЖЕНА: ПРОВЕРКА ПОДПИСКИ + СОГЛАШЕНИЕ")
+# =====================================================================
+# ЧАСТЬ 6: АДМИН-ПАНЕЛЬ
+# =====================================================================
+
+async def reviews(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ ЧИТАТЬ ОТЗЫВЫ", url="https://t.me/poncisnop")],
+        [btn("🔙 НАЗАД", "start")]
+    ])
+    await query.edit_message_text(
+        "⭐ *ОТЗЫВЫ*\n\nНажмите на кнопку, чтобы перейти в канал с отзывами!",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "🆘 ПОДДЕРЖКА\n\n👤 @ponghs\n👤 @Good_NaBloke",
+        reply_markup=back("start")
+    )
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        await query.edit_message_text("❌ Нет доступа!", reply_markup=back("start"))
+        return
+    buttons = [
+        [btn("📱 ДОБАВИТЬ НОМЕР", "add_phone")],
+        [btn("✏️ ИЗМЕНИТЬ ЦЕНУ", "edit_price")]
+    ]
+    if is_super_admin(user_id):
+        buttons.append([btn("➕ ДОБАВИТЬ АДМИНА", "add_admin")])
+        buttons.append([btn("🗑️ УДАЛИТЬ АДМИНА", "remove_admin")])
+        buttons.append([btn("📊 СПИСОК АДМИНОВ", "list_admins")])
+        buttons.append([btn("🗑️ УДАЛИТЬ НОМЕР", "delete_phone")])
+    buttons.append([btn("🔙 НАЗАД", "start")])
+    role = "👑 ГЛАВНЫЙ АДМИН" if is_super_admin(user_id) else "🛠️ МОДЕРАТОР"
+    await query.edit_message_text(f"👥 *АДМИН-ПАНЕЛЬ*\n\nВаша роль: {role}", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+async def add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_super_admin(update.effective_user.id):
+        await query.edit_message_text("❌ Только главный админ!", reply_markup=back("admin_panel"))
+        return
+    await query.edit_message_text("➕ Введите ID пользователя:", reply_markup=back("admin_panel"))
+    return ADD_ADMIN
+
+async def add_admin_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_super_admin(user_id):
+        await update.message.reply_text("❌ Нет доступа!", reply_markup=back("admin_panel"))
+        return ConversationHandler.END
+    new_admin_id = update.message.text.strip()
+    if not new_admin_id.isdigit():
+        await update.message.reply_text("❌ Введите ID (цифры)!", reply_markup=back("admin_panel"))
+        return ADD_ADMIN
+    new_admin_id = int(new_admin_id)
+    if new_admin_id in ALL_ADMINS:
+        await update.message.reply_text(f"❌ Уже есть!", reply_markup=back("admin_panel"))
+        return ConversationHandler.END
+    save_admin_to_db(new_admin_id, 'moderator')
+    MODERATORS.append(new_admin_id)
+    ALL_ADMINS.append(new_admin_id)
+    await update.message.reply_text(f"✅ Добавлен! ID: `{new_admin_id}`", parse_mode="Markdown", reply_markup=back("admin_panel"))
+    return ConversationHandler.END
+
+async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_super_admin(update.effective_user.id):
+        await query.edit_message_text("❌ Только главный админ!", reply_markup=back("admin_panel"))
+        return
+    rows = [[btn(f"👑 {ADMINS[0]} (Главный)", "noop")]]
+    for mod_id in MODERATORS:
+        rows.append([btn(f"🗑️ {mod_id}", f"remove_admin_{mod_id}")])
+    rows.append([btn("🔙 НАЗАД", "admin_panel")])
+    await query.edit_message_text("🗑️ Выберите для удаления:", reply_markup=InlineKeyboardMarkup(rows))
+
+async def remove_admin_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_super_admin(update.effective_user.id):
+        await query.edit_message_text("❌ Нет доступа!", reply_markup=back("admin_panel"))
+        return
+    admin_to_remove = int(query.data.split("_")[2])
+    if admin_to_remove == ADMINS[0]:
+        await query.edit_message_text("❌ Нельзя удалить главного!", reply_markup=back("admin_panel"))
+        return
+    if admin_to_remove in MODERATORS:
+        delete_admin_from_db(admin_to_remove)
+        MODERATORS.remove(admin_to_remove)
+        ALL_ADMINS.remove(admin_to_remove)
+        await query.edit_message_text(f"✅ Удалён!", reply_markup=back("admin_panel"))
+    else:
+        await query.edit_message_text("❌ Не найден!", reply_markup=back("admin_panel"))
+
+async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_super_admin(update.effective_user.id):
+        await query.edit_message_text("❌ Только главный админ!", reply_markup=back("admin_panel"))
+        return
+    text = "📊 *СПИСОК*\n\n👑 Главный: `{}`\n".format(ADMINS[0])
+    if MODERATORS:
+        text += "\n🛠️ Модераторы:\n" + "\n".join([f"• `{m}`" for m in MODERATORS])
+    else:
+        text += "\n🛠️ Модераторов нет"
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back("admin_panel"))
+
+logger.info("✅ ЧАСТЬ 6 ЗАГРУЖЕНА: АДМИН-ПАНЕЛЬ")
+# =====================================================================
+# ЧАСТЬ 7: МАГАЗИН И ПОКУПКИ
+# =====================================================================
+
+async def add_phone_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text("💰 Введи цену в рублях (можно 0):")
+    return PHONE_PRICE
+
+async def add_phone_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        price = int(update.message.text.strip())
+        if price < 0:
+            await update.message.reply_text("❌ Цена не может быть отрицательной!")
+            return PHONE_PRICE
+        context.user_data['price_rub'] = price
+        await update.message.reply_text("⭐ Введи цену в Stars (можно 0):")
+        return PHONE_STARS
+    except ValueError:
+        await update.message.reply_text("❌ Введи число!")
+        return PHONE_PRICE
+
+async def add_phone_stars(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        stars = int(update.message.text.strip())
+        if stars < 0:
+            await update.message.reply_text("❌ Цена не может быть отрицательной!")
+            return PHONE_STARS
+        context.user_data['price_stars'] = stars
+        await update.message.reply_text("📅 Введи возраст аккаунта (в днях, например: 1500):")
+        return PHONE_AGE
+    except ValueError:
+        await update.message.reply_text("❌ Введи число!")
+        return PHONE_STARS
+
+async def add_phone_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        age = int(update.message.text.strip())
+        if age < 0:
+            await update.message.reply_text("❌ Возраст не может быть отрицательным!")
+            return PHONE_AGE
+        context.user_data['age'] = age
+        await update.message.reply_text("📱 Введи номер (например, +79991234567):")
+        return PHONE_NUMBER
+    except ValueError:
+        await update.message.reply_text("❌ Введи число!")
+        return PHONE_AGE
+
+async def add_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = update.message.text.strip()
+    if not validate_phone(phone):
+        await update.message.reply_text("❌ Неверный формат! Пример: +79991234567")
+        return PHONE_NUMBER
+    context.user_data['adding_phone'] = phone
+    context.user_data['adding_price_rub'] = context.user_data['price_rub']
+    context.user_data['adding_price_stars'] = context.user_data['price_stars']
+    context.user_data['age'] = context.user_data['age']
+    await update.message.reply_text("⏳ Отправляю код на номер...")
+    success, msg = await send_code_to_phone(phone, update.effective_user.id)
+    if success:
+        await update.message.reply_text("📲 Введи код из SMS/Telegram:")
+        return ENTER_CODE
+    else:
+        await update.message.reply_text(msg)
+        return PHONE_NUMBER
+
+async def add_phone_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = update.message.text.strip()
+    user_id = update.effective_user.id
+    if not code.isdigit() or len(code) != 5:
+        await update.message.reply_text("❌ Код должен быть из 5 цифр! Попробуй ещё:")
+        return ENTER_CODE
+    await update.message.reply_text(f"🔑 Ввожу код `{code}` в Telegram...", parse_mode="Markdown")
+    success, msg, me, creation_date = await enter_code_in_telegram(code, user_id)
+    if success:
+        phone = context.user_data['adding_phone']
+        price_rub = context.user_data['adding_price_rub']
+        price_stars = context.user_data['adding_price_stars']
+        age = context.user_data['age']
+        session_string = ""
+        async with accounts_lock:
+            if user_id in accounts and phone in accounts[user_id]:
+                session_string = accounts[user_id][phone].get('session', '')
+        add_phone_product(phone, price_rub, price_stars, age, session_string)
+        country_code = get_country_by_phone(phone)
+        country = get_country_by_code(country_code)
+        flag = country['flag'] if country else "🌍"
+        name = country['name'] if country else "Неизвестно"
+        await update.message.reply_text(
+            f"✅ ВОШЁЛ В АККАУНТ!\n\n"
+            f"📱 Номер: {phone}\n"
+            f"🌍 Страна: {flag} {name}\n"
+            f"👤 Имя: {me.first_name}\n\n"
+            f"✅ НОМЕР ДОБАВЛЕН В МАГАЗИН!"
+        )
+        return ConversationHandler.END
+    elif msg == "2FA":
+        await update.message.reply_text("🔐 На аккаунте включена 2FA! Введи пароль:")
+        return ENTER_2FA
+    else:
+        await update.message.reply_text(f"❌ {msg}\n\nПопробуй ещё:")
+        return ENTER_CODE
+
+async def add_phone_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text.strip()
+    user_id = update.effective_user.id
+    await update.message.reply_text("🔐 Ввожу пароль 2FA в Telegram...")
+    success, msg, me, creation_date = await enter_2fa_in_telegram(password, user_id)
+    if success:
+        phone = context.user_data['adding_phone']
+        price_rub = context.user_data['adding_price_rub']
+        price_stars = context.user_data['adding_price_stars']
+        age = context.user_data['age']
+        session_string = ""
+        async with accounts_lock:
+            if user_id in accounts and phone in accounts[user_id]:
+                session_string = accounts[user_id][phone].get('session', '')
+        add_phone_product(phone, price_rub, price_stars, age, session_string)
+        country_code = get_country_by_phone(phone)
+        country = get_country_by_code(country_code)
+        flag = country['flag'] if country else "🌍"
+        name = country['name'] if country else "Неизвестно"
+        await update.message.reply_text(
+            f"✅ ВОШЁЛ В АККАУНТ (с 2FA)!\n\n"
+            f"📱 Номер: {phone}\n"
+            f"🌍 Страна: {flag} {name}\n"
+            f"👤 Имя: {me.first_name}\n\n"
+            f"✅ НОМЕР ДОБАВЛЕН В МАГАЗИН!"
+        )
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text(f"❌ {msg}\n\nПопробуй ещё:")
+        return ENTER_2FA
+
+logger.info("✅ ЧАСТЬ 7 ЗАГРУЖЕНА: МАГАЗИН")
+# =====================================================================
+# ЧАСТЬ 8: ОПЛАТА, ПОЛУЧЕНИЕ КОДА
+# =====================================================================
+
+async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    products = get_phone_products()
+    if not products:
+        await query.edit_message_text("❌ Номеров нет", reply_markup=back("start"))
+        return
+    countries_data = {}
+    for pid, phone, price_rub, price_stars, age in products:
+        country_code = get_country_by_phone(phone)
+        if country_code not in countries_data:
+            countries_data[country_code] = []
+        countries_data[country_code].append((pid, phone, price_rub, price_stars, age))
+    sorted_countries = sorted(countries_data.items(), key=lambda x: get_country_by_code(x[0])['name'] if get_country_by_code(x[0]) else x[0])
+    context.user_data['countries_list'] = sorted_countries
+    context.user_data['current_page'] = 0
+    await show_shop_page(update, context, query, 0)
+
+async def show_shop_page(update, context, query=None, page=0):
+    countries_list = context.user_data.get('countries_list', [])
+    if not countries_list:
+        if query:
+            await query.edit_message_text("❌ Нет стран с номерами", reply_markup=back("start"))
+        return
+    total_pages = (len(countries_list) + 5) // 6
+    if page >= total_pages:
+        page = total_pages - 1
+    if page < 0:
+        page = 0
+    start_idx = page * 6
+    end_idx = min(start_idx + 6, len(countries_list))
+    page_countries = countries_list[start_idx:end_idx]
+    rows = []
+    for country_code, phones in page_countries:
+        country = get_country_by_code(country_code)
+        if country:
+            rows.append([btn(f"{country['flag']} {country['name']} ({country['phone_code']}) · {len(phones)} шт.", f"shop_country_{country_code}")])
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(btn("⬅️ НАЗАД", f"shop_page_{page-1}"))
+    if page < total_pages - 1:
+        nav_buttons.append(btn("➡️ ДАЛЕЕ", f"shop_page_{page+1}"))
+    if nav_buttons:
+        rows.append(nav_buttons)
+    rows.append([btn("🔙 НАЗАД", "start")])
+    text = f"🏪 *МАГАЗИН PONCHI*\n\nВыберите страну аккаунта:\n📄 Страница {page+1} из {total_pages}"
+    if query:
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+    else:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+async def shop_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split("_")[2])
+    context.user_data['current_page'] = page
+    await show_shop_page(update, context, query, page)
+
+async def shop_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    country_code = query.data.replace("shop_country_", "")
+    country = get_country_by_code(country_code)
+    if not country:
+        await query.edit_message_text("❌ Страна не найдена", reply_markup=back("shop"))
+        return
+    products = get_phone_products()
+    country_phones = []
+    for pid, phone, price_rub, price_stars, age in products:
+        if phone.startswith(country['phone_code']):
+            country_phones.append((pid, phone, price_rub, price_stars, age))
+    if not country_phones:
+        await query.edit_message_text(f"❌ Нет номеров для {country['flag']} {country['name']}", reply_markup=back("shop"))
+        return
+    country_phones.sort(key=lambda x: x[2])
+    rows = []
+    for idx, (pid, phone, price_rub, price_stars, age) in enumerate(country_phones, 1):
+        rows.append([btn(f"[{idx}] {country['flag']} {country['phone_code']} | {price_stars}⭐ / {price_rub}₽ | {age}дн.", f"select_phone_{pid}")])
+    rows.append([btn("🔙 НАЗАД", "shop")])
+    await query.edit_message_text(
+        f"📍 *{country['flag']} {country['name']} ({country['phone_code']})*\n\n📱 Доступно: {len(country_phones)} номеров\nСортировка по цене ↑",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+async def select_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    product_id = int(query.data.split("_")[2])
+    product = get_phone_product(product_id)
+    if not product:
+        await query.edit_message_text("❌ Номер уже продан или удалён")
+        return
+    pid, phone, price_rub, price_stars, age, session = product[:6]
+    country_code = get_country_by_phone(phone)
+    country = get_country_by_code(country_code) if country_code else None
+    flag = country['flag'] if country else "🌍"
+    name = country['name'] if country else "Неизвестно"
+    code = country['phone_code'] if country else ""
+    hidden_phone = f"{phone[:4]}****{phone[-4:]}" if len(phone) > 6 else phone
+    buttons = []
+    if price_stars > 0:
+        buttons.append([btn(f"⭐ Оплатить {price_stars} Stars", f"pay_stars_{product_id}")])
+    if price_rub > 0:
+        buttons.append([btn(f"💳 Оплатить {price_rub} ₽", f"pay_rub_{product_id}")])
+    buttons.append([btn("🔙 НАЗАД", "shop")])
+    await query.edit_message_text(
+        f"💳 *ОПЛАТА*\n\n🌍 *Страна:* {flag} {name} ({code})\n📱 *Номер:* `{hidden_phone}`\n📅 *Возраст:* {age} дней\n⭐ *Цена:* {price_stars} Stars\n💰 *Цена:* {price_rub} ₽\n\n⚠️ После оплаты вы получите полный номер и код для входа.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def my_purchases(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    purchases = get_user_purchases(user_id)
+    if not purchases:
+        await query.edit_message_text("📦 *МОИ ПОКУПКИ*\n\nУ вас пока нет покупок.", parse_mode="Markdown", reply_markup=back("start"))
+        return
+    rows = []
+    for purchase in purchases:
+        pid, phone, price_rub, price_stars, age, session, country_code, purchased_at = purchase
+        country = get_country_by_code(country_code) if country_code else None
+        flag = country['flag'] if country else "🌍"
+        code = country['phone_code'] if country else ""
+        rows.append([btn(f"{flag} {code} {phone}", f"purchase_code_{pid}")])
+    rows.append([btn("🗑️ ОЧИСТИТЬ ИСТОРИЮ", "clear_purchases")])
+    rows.append([btn("🔙 НАЗАД", "start")])
+    await query.edit_message_text(
+        f"📦 *МОИ ПОКУПКИ*\n\n📱 Всего покупок: {len(purchases)}\n\nВыберите номер для просмотра информации:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+async def purchase_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    purchase_id = int(query.data.replace("purchase_code_", ""))
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    row = conn.execute("SELECT phone, price_rub, price_stars, age, session, country_code, purchased_at FROM purchases WHERE id=?", (purchase_id,)).fetchone()
+    conn.close()
+    if not row:
+        await query.edit_message_text("❌ Покупка не найдена", reply_markup=back("my_purchases"))
+        return
+    phone, price_rub, price_stars, age, session, country_code, purchased_at = row
+    country = get_country_by_code(country_code) if country_code else None
+    flag = country['flag'] if country else "🌍"
+    name = country['name'] if country else "Неизвестно"
+    code = country['phone_code'] if country else ""
+    date_str = purchased_at if isinstance(purchased_at, str) else str(purchased_at)
+    await query.edit_message_text(
+        f"📱 *ИНФОРМАЦИЯ О НОМЕРЕ*\n\n🌍 *Страна:* {flag} {name} ({code})\n📞 *Номер:* `{phone}`\n📅 *Возраст:* {age} дней\n💰 *Цена:* {price_rub} ₽ / {price_stars}⭐\n📆 *Дата покупки:* {date_str}\n\n---\n⚠️ *ПОСЛЕ ВХОДА В АККАУНТ ОБЯЗАТЕЛЬНО:*\n1️⃣ Смените номер телефона на свой\n2️⃣ Поставьте 2FA\n3️⃣ Установите облачный пароль\n4️⃣ Привяжите почту\n\n🔑 Нажмите кнопку, чтобы получить код:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [btn("🔑 ПОЛУЧИТЬ КОД", f"purchase_get_code_{purchase_id}")],
+            [btn("🔙 К МОИМ ПОКУПКАМ", "my_purchases")]
+        ])
+    )
+
+async def purchase_get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    purchase_id = int(query.data.replace("purchase_get_code_", ""))
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    row = conn.execute("SELECT phone, session FROM purchases WHERE id=?", (purchase_id,)).fetchone()
+    conn.close()
+    if not row:
+        await query.edit_message_text("❌ Покупка не найдена", reply_markup=back("my_purchases"))
+        return
+    phone, session = row
+    await query.edit_message_text(f"🔍 *ИЩУ КОД ДЛЯ НОМЕРА*\n\n📞 {phone}\n\n⏳ Подключаюсь к аккаунту...", parse_mode="Markdown")
+    code_found, result = await get_last_code_from_account(phone, session)
+    if code_found:
+        await query.edit_message_text(
+            f"🔑 *САМЫЙ СВЕЖИЙ КОД НАЙДЕН!*\n\n📞 Номер: `{phone}`\n🔑 Код: `{code_found}`\n\n✅ Код подошёл?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [btn("✅ КОД ПОДОШЁЛ", f"purchase_ok_{purchase_id}")],
+                [btn("🔄 НОВЫЙ КОД", f"purchase_get_code_{purchase_id}")],
+                [btn("🔙 К МОИМ ПОКУПКАМ", "my_purchases")]
+            ])
+        )
+    else:
+        await query.edit_message_text(
+            f"⚠️ *КОД НЕ НАЙДЕН*\n\n📞 {phone}\n❌ {result}\n\nПопробуйте ещё раз.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [btn("🔄 ПОВТОРИТЬ", f"purchase_get_code_{purchase_id}")],
+                [btn("🔙 К МОИМ ПОКУПКАМ", "my_purchases")]
+            ])
+        )
+
+async def purchase_ok(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    purchase_id = int(query.data.replace("purchase_ok_", ""))
+    await query.edit_message_text(
+        f"🎉 *СДЕЛКА ЗАВЕРШЕНА!*\n\n✅ Код подошёл! Аккаунт ваш!\nСпасибо за покупку! 🙏\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚠️ *ВНИМАНИЕ! ОБЯЗАТЕЛЬНО ПРОЧИТАЙТЕ!* ⚠️\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n❗ *СРАЗУ ПОСЛЕ ВХОДА В АККАУНТ СДЕЛАЙТЕ ЭТО:*\n\n1️⃣ *СМЕНИТЕ НОМЕР ТЕЛЕФОНА* НА СВОЙ! 🔄\n2️⃣ *ПОСТАВЬТЕ ДВУХФАКТОРНУЮ АУТЕНТИФИКАЦИЮ* (2FA)! 🔐\n3️⃣ *УСТАНОВИТЕ ОБЛАЧНЫЙ ПАРОЛЬ*! ☁️\n4️⃣ *ПРИВЯЖИТЕ ПОЧТУ* ДЛЯ ВОССТАНОВЛЕНИЯ! 📧\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🔒 *ЭТО ЗАЩИТИТ ВАШ АККАУНТ ОТ ВЗЛОМА!* 🔒\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⭐ Если вам понравилась работа бота, оставьте отзыв в нашем канале!",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⭐ ОСТАВИТЬ ОТЗЫВ", url="https://t.me/poncisnop")],
+            [btn("🏠 ГЛАВНОЕ МЕНЮ", "start")]
+        ])
+    )
+
+async def clear_purchases_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    count = conn.execute("SELECT COUNT(*) FROM purchases WHERE user_id=?", (user_id,)).fetchone()[0]
+    conn.close()
+    if count == 0:
+        await query.edit_message_text("📦 *МОИ ПОКУПКИ*\n\nУ вас нет покупок для очистки.", parse_mode="Markdown", reply_markup=back("my_purchases"))
+        return
+    await query.edit_message_text(
+        f"🗑️ *ОЧИСТКА ИСТОРИИ ПОКУПОК*\n\n⚠️ Вы уверены, что хотите удалить ВСЕ свои покупки?\n\n📱 Всего покупок: {count}\n\nЭто действие НЕЛЬЗЯ будет отменить!",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [btn("✅ ДА, УДАЛИТЬ ВСЕ", "clear_purchases_yes")],
+            [btn("❌ НЕТ", "my_purchases")]
+        ])
+    )
+
+async def clear_purchases_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    delete_user_purchases(user_id)
+    await query.edit_message_text("✅ *ИСТОРИЯ ОЧИЩЕНА!*\n\nВсе ваши покупки удалены.", parse_mode="Markdown", reply_markup=back("my_purchases"))
+
+logger.info("✅ ЧАСТЬ 8 ЗАГРУЖЕНА: ОПЛАТА + ПОЛУЧЕНИЕ КОДА")
+# =====================================================================
+# ЧАСТЬ 9: FLASK, ВЕБХУК И ЗАПУСК
+# =====================================================================
+
+from flask import Flask, request
+
+flask_app = Flask(__name__)
+
+def generate_product_message(phone, age, price_rub, price_stars):
+    country_code = get_country_by_phone(phone)
+    country = get_country_by_code(country_code) if country_code else None
+    flag = country['flag'] if country else "🌍"
+    name = country['name'] if country else "Неизвестно"
+    code = country['phone_code'] if country else ""
+    return (
+        f"✅ *ОПЛАЧЕНО!*\n\n"
+        f"🌍 *Страна:* {flag} {name} ({code})\n"
+        f"📱 *ВАШ НОМЕР:* `{phone}`\n"
+        f"📅 *Возраст:* {age} дней\n"
+        f"💰 {price_rub} ₽ / {price_stars}⭐\n\n"
+        f"---\n"
+        f"⚠️ *ПОСЛЕ ВХОДА В АККАУНТ ОБЯЗАТЕЛЬНО:*\n"
+        f"1️⃣ Смените номер телефона на свой\n"
+        f"2️⃣ Поставьте двухфакторную аутентификацию (2FA)\n"
+        f"3️⃣ Установите облачный пароль\n"
+        f"4️⃣ Привяжите почту для восстановления\n\n"
+        f"🔑 Нажмите кнопку, чтобы получить код для входа:"
+    )
+
+async def pay_stars(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    product_id = int(query.data.split("_")[2])
+    product = get_phone_product(product_id)
+    if not product:
+        await query.edit_message_text("❌ Не найден")
+        return
+    pid, phone, price_rub, price_stars, age, session = product[:6]
+    await query.message.reply_invoice(
+        title=f"Номер {phone[:4]}****{phone[-4:]}",
+        description=f"Возраст: {age} дней",
+        payload=f"product_{product_id}_{update.effective_user.id}",
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label="Номер", amount=price_stars)],
+        start_parameter=f"buy_phone_{product_id}"
+    )
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.pre_checkout_query.answer(ok=True)
+
+async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    payload = update.message.successful_payment.invoice_payload
+    parts = payload.split("_")
+    product_id = int(parts[1])
+    user_id = update.effective_user.id
+    product = get_phone_product(product_id)
+    if not product:
+        await update.message.reply_text("❌ Номер не найден")
+        return
+    pid, phone, price_rub, price_stars, age, session = product[:6]
+    delete_phone_product(product_id)
+    country_code = get_country_by_phone(phone)
+    add_purchase(user_id, phone, price_rub, price_stars, age, session, country_code)
+    awaiting_phone_confirmation[user_id] = {"phone": phone, "product_id": product_id, "session": session}
+    await update.message.reply_text(
+        generate_product_message(phone, age, price_rub, price_stars),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [btn("🔑 ПОЛУЧИТЬ КОД", "get_code")],
+            [btn("🏠 ГЛАВНОЕ МЕНЮ", "start")]
+        ])
+    )
+
+async def pay_rub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    product_id = int(query.data.split("_")[2])
+    product = get_phone_product(product_id)
+    if not product:
+        await query.edit_message_text("❌ Номер больше не доступен!")
+        return
+    product_id, phone, price_rub, price_stars, age, session = product
+    user_id = query.from_user.id
+    label = f"rub_{product_id}_{user_id}_{int(time.time())}"
+    pending_rub[user_id] = {'product_id': product_id, 'phone': phone, 'label': label}
+    payment_url = f"https://yoomoney.ru/quickpay/confirm.xml?receiver={YOOMONEY_WALLET}&quickpay-form=small&sum={price_rub}&label={label}"
+    await query.edit_message_text(
+        f"💳 *ОПЛАТА РУБЛЯМИ*\n\nСумма: {price_rub} ₽\n\n🔗 Нажмите на кнопку ниже для оплаты\n✅ После оплаты товар выдастся АВТОМАТИЧЕСКИ",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"💳 ОПЛАТИТЬ {price_rub} ₽", url=payment_url)],
+            [btn("🔙 НАЗАД", "shop")]
+        ])
+    )
+
+async def check_rub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    product_id = int(query.data.split("_")[2])
+    user_id = query.from_user.id
+    pending = pending_rub.get(user_id)
+    if not pending or pending["product_id"] != product_id:
+        await query.edit_message_text("❌ Заказ не найден.", reply_markup=back("shop"))
+        return
+    product = get_phone_product(product_id)
+    if not product:
+        await query.edit_message_text("❌ Товар не найден!", reply_markup=back("shop"))
+        return
+    pid, phone, price_rub, price_stars, age, session = product[:6]
+    delete_phone_product(product_id)
+    country_code = get_country_by_phone(phone)
+    add_purchase(user_id, phone, price_rub, price_stars, age, session, country_code)
+    awaiting_phone_confirmation[user_id] = {"phone": phone, "product_id": product_id, "session": session}
+    pending_rub.pop(user_id, None)
+    await query.edit_message_text(
+        generate_product_message(phone, age, price_rub, price_stars),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [btn("🔑 ПОЛУЧИТЬ КОД", "get_code")],
+            [btn("🏠 ГЛАВНОЕ МЕНЮ", "start")]
+        ])
+    )
+
+async def auto_deliver_product(user_id, product_id):
+    if user_id not in pending_rub:
+        return
+    pending = pending_rub[user_id]
+    product = get_phone_product(product_id)
+    if not product:
+        del pending_rub[user_id]
+        return
+    product_id, phone, price_rub, price_stars, age, session = product
+    delete_phone_product(product_id)
+    country_code = get_country_by_phone(phone)
+    add_purchase(user_id, phone, price_rub, price_stars, age, session, country_code)
+    awaiting_phone_confirmation[user_id] = {"phone": phone, "product_id": product_id, "session": session}
+    del pending_rub[user_id]
+    try:
+        await application.bot.send_message(
+            chat_id=user_id,
+            text=generate_product_message(phone, age, price_rub, price_stars),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [btn("🔑 ПОЛУЧИТЬ КОД", "get_code")],
+                [btn("🏠 ГЛАВНОЕ МЕНЮ", "start")]
+            ])
+        )
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки: {e}")
+
+async def get_code_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if user_id not in awaiting_phone_confirmation:
+        await query.edit_message_text("❌ Нет номеров для получения кода!")
+        return
+    data = awaiting_phone_confirmation[user_id]
+    phone = data['phone']
+    session = data['session']
+    await query.edit_message_text(f"🔍 *ИЩУ КОД ДЛЯ НОМЕРА*\n\n📞 {phone}\n\n⏳ Подключаюсь к аккаунту...", parse_mode="Markdown")
+    code_found, result = await get_last_code_from_account(phone, session)
+    if code_found:
+        await query.edit_message_text(
+            f"🔑 *САМЫЙ СВЕЖИЙ КОД НАЙДЕН!*\n\n📞 Номер: `{phone}`\n🔑 Код: `{code_found}`\n\n✅ Код подошёл для входа?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [btn("✅ КОД ПОДОШЁЛ", "code_ok")],
+                [btn("🔄 НОВЫЙ КОД", "get_code")],
+                [btn("🏠 ГЛАВНОЕ МЕНЮ", "start")]
+            ])
+        )
+    else:
+        await query.edit_message_text(
+            f"⚠️ *КОД НЕ НАЙДЕН*\n\n📞 Номер: `{phone}`\n❌ {result}\n\nПопробуйте повторить поиск.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [btn("🔄 ПОВТОРИТЬ ПОИСК", "get_code")],
+                [btn("🏠 ГЛАВНОЕ МЕНЮ", "start")]
+            ])
+        )
+
+async def code_ok_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if user_id in awaiting_phone_confirmation:
+        del awaiting_phone_confirmation[user_id]
+    await query.edit_message_text(
+        f"🎉 *СДЕЛКА ЗАВЕРШЕНА!*\n\n✅ Код подошёл! Аккаунт ваш!\nСпасибо за покупку! 🙏\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚠️ *ВНИМАНИЕ! ОБЯЗАТЕЛЬНО ПРОЧИТАЙТЕ!* ⚠️\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n❗ *СРАЗУ ПОСЛЕ ВХОДА В АККАУНТ СДЕЛАЙТЕ ЭТО:*\n\n1️⃣ *СМЕНИТЕ НОМЕР ТЕЛЕФОНА* НА СВОЙ! 🔄\n2️⃣ *ПОСТАВЬТЕ ДВУХФАКТОРНУЮ АУТЕНТИФИКАЦИЮ* (2FA)! 🔐\n3️⃣ *УСТАНОВИТЕ ОБЛАЧНЫЙ ПАРОЛЬ*! ☁️\n4️⃣ *ПРИВЯЖИТЕ ПОЧТУ* ДЛЯ ВОССТАНОВЛЕНИЯ! 📧\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🔒 *ЭТО ЗАЩИТИТ ВАШ АККАУНТ ОТ ВЗЛОМА!* 🔒\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⭐ Если вам понравилась работа бота, оставьте отзыв в нашем канале!",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⭐ ОСТАВИТЬ ОТЗЫВ", url="https://t.me/poncisnop")],
+            [btn("🏠 ГЛАВНОЕ МЕНЮ", "start")]
+        ])
+    )
+
+def start_flask():
+    flask_app.run(host="0.0.0.0", port=10000, debug=False, use_reloader=False)
+
+@flask_app.route('/', methods=['POST'])
+def yoomoney_webhook():
+    data = request.form
+    logger.info(f"📨 Получен вебхук: {data}")
+    if data.get('notification_type') == 'card-incoming':
+        label = data.get('label')
+        if label and label.startswith('rub_'):
+            parts = label.split('_')
+            if len(parts) >= 3:
+                product_id = int(parts[1])
+                user_id = int(parts[2])
+                asyncio.run_coroutine_threadsafe(
+                    auto_deliver_product(user_id, product_id),
+                    asyncio.get_event_loop()
+                )
+    return "OK", 200
+
+@flask_app.route('/', methods=['GET'])
+def webhook_test():
+    return "✅ Webhook работает!", 200
+
+def main():
+    logger.info("=" * 60)
+    logger.info("🚀 ЗАПУСК БОТА...")
+    logger.info("=" * 60)
+    load_admins_from_db()
+    logger.info(f"👑 Загружены админы: {ADMINS}")
+    logger.info(f"🛠️ Загружены модераторы: {MODERATORS}")
+    flask_thread = threading.Thread(target=start_flask, daemon=True)
+    flask_thread.start()
+    logger.info("✅ Flask-сервер запущен на порту 10000")
+    app = Application.builder().token(BOT_TOKEN).build()
+    global application
+    application = app
+
+    add_admin_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(add_admin_start, pattern="^add_admin$")],
+        states={ADD_ADMIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_admin_confirm)]},
+        fallbacks=[CommandHandler("start", start)]
+    )
+
+    add_phone_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(add_phone_start, pattern="^add_phone$")],
+        states={
+            PHONE_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_phone_price)],
+            PHONE_STARS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_phone_stars)],
+            PHONE_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_phone_age)],
+            PHONE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_phone_number)],
+            ENTER_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_phone_code)],
+            ENTER_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_phone_2fa)],
+        },
+        fallbacks=[CommandHandler("start", start)]
+    )
+
+    edit_rub_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(edit_rub_start, pattern="^edit_rub$")],
+        states={EDIT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_rub_input)]},
+        fallbacks=[CommandHandler("start", start)]
+    )
+
+    edit_stars_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(edit_stars_start, pattern="^edit_stars$")],
+        states={EDIT_STARS: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_stars_input)]},
+        fallbacks=[CommandHandler("start", start)]
+    )
+
+    app.add_handler(add_admin_conv)
+    app.add_handler(add_phone_conv)
+    app.add_handler(edit_rub_conv)
+    app.add_handler(edit_stars_conv)
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(start_callback, pattern="^start$"))
+    app.add_handler(CallbackQueryHandler(check_subscription_button, pattern="^check_sub$"))
+    app.add_handler(CallbackQueryHandler(agree_terms, pattern="^agree_terms$"))
+    app.add_handler(CallbackQueryHandler(disagree_terms, pattern="^disagree_terms$"))
+    app.add_handler(CallbackQueryHandler(reviews, pattern="^reviews$"))
+    app.add_handler(CallbackQueryHandler(support, pattern="^support$"))
+    app.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin_panel$"))
+    app.add_handler(CallbackQueryHandler(remove_admin, pattern="^remove_admin$"))
+    app.add_handler(CallbackQueryHandler(remove_admin_confirm, pattern="^remove_admin_\\d+$"))
+    app.add_handler(CallbackQueryHandler(list_admins, pattern="^list_admins$"))
+
+    app.add_handler(CallbackQueryHandler(shop, pattern="^shop$"))
+    app.add_handler(CallbackQueryHandler(shop_page, pattern="^shop_page_\\d+$"))
+    app.add_handler(CallbackQueryHandler(shop_country, pattern="^shop_country_"))
+    app.add_handler(CallbackQueryHandler(select_phone, pattern="^select_phone_\\d+$"))
+
+    app.add_handler(CallbackQueryHandler(delete_phone_start, pattern="^delete_phone$"))
+    app.add_handler(CallbackQueryHandler(delete_phone_confirm, pattern="^del_phone_\\d+$"))
+    app.add_handler(CallbackQueryHandler(delete_phone_yes, pattern="^del_yes_\\d+$"))
+
+    app.add_handler(CallbackQueryHandler(edit_price_start, pattern="^edit_price$"))
+    app.add_handler(CallbackQueryHandler(edit_select_phone, pattern="^edit_select_\\d+$"))
+
+    app.add_handler(CallbackQueryHandler(pay_stars, pattern="^pay_stars_\\d+$"))
+    app.add_handler(CallbackQueryHandler(pay_rub, pattern="^pay_rub_\\d+$"))
+    app.add_handler(CallbackQueryHandler(check_rub, pattern="^check_rub_\\d+$"))
+
+    app.add_handler(CallbackQueryHandler(get_code_button, pattern="^get_code$"))
+    app.add_handler(CallbackQueryHandler(code_ok_button, pattern="^code_ok$"))
+
+    app.add_handler(CallbackQueryHandler(my_purchases, pattern="^my_purchases$"))
+    app.add_handler(CallbackQueryHandler(purchase_code, pattern="^purchase_code_\\d+$"))
+    app.add_handler(CallbackQueryHandler(purchase_get_code, pattern="^purchase_get_code_\\d+$"))
+    app.add_handler(CallbackQueryHandler(purchase_ok, pattern="^purchase_ok_\\d+$"))
+    app.add_handler(CallbackQueryHandler(clear_purchases_start, pattern="^clear_purchases$"))
+    app.add_handler(CallbackQueryHandler(clear_purchases_yes, pattern="^clear_purchases_yes$"))
+
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+
+    logger.info("=" * 60)
+    logger.info("✅ БОТ ГОТОВ К РАБОТЕ!")
+    logger.info("👑 ГЛАВНЫЙ АДМИН: " + str(ADMINS[0]))
+    logger.info("🛠️ МОДЕРАТОРЫ: " + str(MODERATORS if MODERATORS else "Нет"))
+    logger.info("=" * 60)
+
+    while True:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(app.run_polling())
+            break
+        except RuntimeError as e:
+            if "Event loop is closed" in str(e):
+                logger.warning("🔄 Перезапуск цикла...")
+                continue
+            else:
+                raise e
+        except KeyboardInterrupt:
+            logger.info("🛑 Бот остановлен пользователем")
+            break
+        except Exception as e:
+            logger.error(f"❌ Критическая ошибка: {e}")
+            logger.info("🔄 Перезапуск через 5 секунд...")
+            time.sleep(5)
+        finally:
+            try:
+                loop.close()
+            except:
+                pass
+
+if __name__ == "__main__":
+    main()
