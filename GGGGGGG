@@ -1,0 +1,254 @@
+from telethon import TelegramClient, events
+import asyncio
+import random
+from datetime import datetime, timedelta
+
+API_ID = 37929729
+API_HASH = "a9b0048cb977e7efe52c0e9ebef901e1"
+PHONE = "+79256884470"
+
+# ----- ГРУППЫ (ДОБАВЛЕНЫ НОВЫЕ) -----
+TARGET_CHATS = [
+    -1001736935302,
+    -1002029765485,
+    -1002245746117,
+    -1002380161261,
+    -1001669674048,
+    -1004378879703,   # Новая группа 6
+    -1002894997551,   # Новая группа 7
+    -1002820020827,   # Новая группа 8
+]
+# --------------------------------------
+
+# ----- РАЗНЫЕ ТЕКСТЫ ДЛЯ ОТВЕТОВ -----
+REPLY_TEXTS = [
+    """ГОТОВО БРО ТЕПЕРЬ ТЫ ПЖ
+
+https://t.me/+ZrbVOx3MaEozM2Qy""",
+    """БРО ГОТОВО, ТЫ ТЕПЕРЬ
+
+https://t.me/+ZrbVOx3MaEozM2Qy""",
+    """ВСЁ ТЕПЕРЬ ТЫ 
+
+https://t.me/+ZrbVOx3MaEozM2Qy""",
+    """ГОТОВО ТЕПЕРЬ ТЫ ПЖ
+
+https://t.me/+ZrbVOx3MaEozM2Qy""",
+]
+# ---------------------------------------------------------
+
+# ---------- КЛЮЧЕВЫЕ СЛОВА ----------
+KEYWORDS = [
+    "подпишись", "подписка", "подписывайтесь", "подпишитесь",
+    "подпишусь", "подписался", "подписаться",
+    "подпишись на меня", "подпишись пожалуйста",
+    "подпишись пж", "подпишитесь пж",
+    "подпишись на канал", "подпишитесь на канал",
+    "подпишись и я подпишусь",
+    "подпишитесь на меня", "подписывайтесь на меня",
+    "не забудь подписаться", "не забудьте подписаться",
+    "взаимная подписка", "взаимно", "вз",
+    "взаимная", "взаимно подпишемся",
+    "подписка взаимно", "вз подписка",
+    "вз подпишись", "взаимная подпишись",
+    "взп", "взаимоподписка",
+    "подпишись взаимно", "взаимно подпишись",
+    "я подписался", "я подписался на тебя",
+    "пж", "пожалуйста", "пжлст", "пжл", "плз", "плиз",
+    "лайк", "лайки", "лайкай", "лайкни",
+    "поставь лайк", "поставьте лайк",
+    "взаимный лайк", "взаимные лайки",
+    "лайк взаимно", "лайк взамен",
+    "кинь лайк", "киньте лайк",
+    "лайкни меня", "лайкните меня",
+    "ставь лайк", "ставьте лайк",
+    "лайк за лайк", "вз лайк",
+    "просмотр", "просмотры", "просмотри",
+    "посмотри", "посмотрите",
+    "взаимный просмотр", "взаимные просмотры",
+    "просмотр взаимно", "просмотры взаимно",
+    "кинь просмотр", "киньте просмотр",
+    "вз просмотр", "вз просмотры",
+    "просмотр за просмотр",
+    "репост", "репосты", "репостни",
+    "расшарить", "расшарь",
+    "взаимный репост", "репост взаимно",
+    "перешли", "перешлите",
+    "поддержка", "поддержи", "поддержите",
+    "коммент", "комментарий", "комментарии",
+    "напиши коммент", "оставь коммент",
+    "взаимный коммент", "коммент взаимно",
+    "актив", "активность", "активничай",
+    "взаимный актив", "актив взаимно",
+    "залетай", "залетайте",
+    "будь активным", "будьте активными",
+    "лайк и подписка", "подписка и лайк",
+    "просмотр и подписка",
+    "активность взаимно", "взаимная активность",
+]
+# ------------------------------------
+
+# ---- НАСТРОЙКИ ----
+BATCH_SIZE = 4
+COOLDOWN = 11
+# -------------------
+
+# ---- ДАННЫЕ ДЛЯ КАЖДОГО ЧАТА ----
+chat_data = {}
+# -----------------------------------
+
+async def main():
+    async with TelegramClient('test_session', API_ID, API_HASH) as client:
+        await client.start(phone=PHONE)
+        
+        chats = {}
+        for chat_id in TARGET_CHATS:
+            try:
+                chat = await client.get_entity(chat_id)
+                chats[chat_id] = chat
+                chat_data[chat_id] = {
+                    'queue': [],
+                    'cooldown': False,
+                    'answered_ids': set()
+                }
+                print(f"✅ Подключен к: {chat.title if hasattr(chat, 'title') else chat.id}")
+            except Exception as e:
+                print(f"❌ Ошибка подключения к {chat_id}: {e}")
+        
+        if not chats:
+            print("❌ Нет доступных чатов!")
+            return
+        
+        print(f"📊 Отслеживаю {len(KEYWORDS)} ключевых слов")
+        print(f"📦 Отвечаю по {BATCH_SIZE} сообщений в КАЖДОМ чате за раз")
+        print(f"⏱ У каждого чата СВОЯ пауза {COOLDOWN} секунд")
+        print(f"📊 Всего чатов: {len(TARGET_CHATS)}")
+        print(f"🚀 БЕЗ ОГРАНИЧЕНИЙ — работает пока не остановишь")
+        print("-" * 40)
+        
+        @client.on(events.NewMessage(chats=list(chats.values())))
+        async def reply_to_message(event):
+            if event.out:
+                return
+            
+            chat_id = event.chat.id
+            if chat_id not in chat_data:
+                return
+            
+            data = chat_data[chat_id]
+            
+            message_age = (datetime.now().astimezone() - event.message.date).total_seconds()
+            if message_age > 30:
+                return
+            
+            if event.message.id in data['answered_ids']:
+                return
+            
+            text = event.message.text.lower()
+            
+            # ---- ПРОВЕРКА: ЕСТЬ ЛИ ССЫЛКА В СООБЩЕНИИ ----
+            if "t.me" not in text and "http" not in text:
+                return
+            # ----------------------------------------------
+            
+            found_keyword = None
+            for keyword in KEYWORDS:
+                if keyword in text:
+                    found_keyword = keyword
+                    break
+            
+            if not found_keyword:
+                return
+            
+            if data['cooldown']:
+                return
+            
+            if len(data['queue']) >= BATCH_SIZE:
+                return
+            
+            data['queue'].append({
+                'id': event.message.id,
+                'keyword': found_keyword,
+                'chat': event.chat,
+                'date': event.message.date,
+            })
+            
+            data['queue'].sort(key=lambda x: x['date'], reverse=True)
+            
+            chat_name = event.chat.title if hasattr(event.chat, 'title') else event.chat.id
+            print(f"📥 [{chat_name}] Добавлено в очередь ({len(data['queue'])}/{BATCH_SIZE}): '{found_keyword}'")
+            
+            if len(data['queue']) >= BATCH_SIZE and not data['cooldown']:
+                asyncio.create_task(process_chat_batch(chat_id))
+        
+        async def process_chat_batch(chat_id):
+            data = chat_data[chat_id]
+            data['cooldown'] = True
+            
+            batch = data['queue'][:BATCH_SIZE]
+            data['queue'] = data['queue'][BATCH_SIZE:]
+            
+            chat_name = batch[0]['chat'].title if hasattr(batch[0]['chat'], 'title') else batch[0]['chat'].id
+            
+            print(f"📦 [{chat_name}] Отвечаю на {len(batch)} сообщений...")
+            
+            for msg_data in batch:
+                try:
+                    reply_text = random.choice(REPLY_TEXTS)
+                    
+                    await client.send_message(
+                        msg_data['chat'],
+                        reply_text,
+                        reply_to=msg_data['id']
+                    )
+                    data['answered_ids'].add(msg_data['id'])
+                    print(f"📤 [{chat_name}] Ответил на {msg_data['keyword']} (ID: {msg_data['id']})")
+                except Exception as e:
+                    error_msg = str(e)
+                    print(f"❌ [{chat_name}] Ошибка: {error_msg}")
+                    
+                    if "FloodWait" in error_msg:
+                        try:
+                            import re
+                            match = re.search(r'(\d+)', error_msg)
+                            if match:
+                                wait_time = int(match.group(1))
+                                print(f"⏳ [{chat_name}] FloodWait на {wait_time} сек. Ждём...")
+                                await asyncio.sleep(wait_time + 5)
+                                await client.send_message(
+                                    msg_data['chat'],
+                                    random.choice(REPLY_TEXTS),
+                                    reply_to=msg_data['id']
+                                )
+                                data['answered_ids'].add(msg_data['id'])
+                                print(f"📤 [{chat_name}] Повторно ответил после FloodWait")
+                        except:
+                            print(f"❌ [{chat_name}] Не удалось обработать FloodWait")
+            
+            print(f"✅ [{chat_name}] Партия отправлена")
+            print(f"⏱ [{chat_name}] Пауза {COOLDOWN} секунд...")
+            
+            await asyncio.sleep(COOLDOWN)
+            
+            data['cooldown'] = False
+            
+            if len(data['queue']) >= BATCH_SIZE:
+                asyncio.create_task(process_chat_batch(chat_id))
+            else:
+                print(f"✅ [{chat_name}] Готов к новой партии")
+                print("-" * 40)
+        
+        print("✅ Ожидаю сообщения...")
+        await client.run_until_disconnected()
+
+# ---- АВТОМАТИЧЕСКИЙ ПЕРЕЗАПУСК ПРИ ОШИБКЕ ----
+if __name__ == "__main__":
+    while True:
+        try:
+            asyncio.run(main())
+            break
+        except Exception as e:
+            print(f"❌ Критическая ошибка: {e}")
+            print("🔄 Перезапуск через 5 секунд...")
+            asyncio.run(asyncio.sleep(5))
+# ------------------------------------------------
